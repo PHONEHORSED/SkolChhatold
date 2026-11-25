@@ -1,0 +1,274 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Live Stranger Chat</title>
+  <script src="https://unpkg.com"></script>
+  <style>
+    * { box-sizing: border-box; font-family: system-ui, -apple-system, sans-serif; }
+    body { margin: 0; background: #121212; color: #f0f0f0; display: flex; justify-content: center; align-items: center; height: 100vh; padding: 16px; }
+    .card { background: #1e1e1e; padding: 24px; border-radius: 12px; width: 100%; max-width: 450px; box-shadow: 0 8px 24px rgba(0,0,0,0.4); }
+    h2 { margin-top: 0; text-align: center; }
+    input { width: 100%; padding: 12px; margin: 8px 0; border-radius: 8px; border: 1px solid #333; background: #2a2a2a; color: #fff; font-size: 16px; }
+    button { width: 100%; padding: 12px; margin-top: 8px; border: none; border-radius: 8px; background: #4f46e5; color: white; font-size: 16px; font-weight: bold; cursor: pointer; }
+    button:hover { background: #4338ca; }
+    button:disabled { background: #555; cursor: not-allowed; }
+    button.secondary { background: #333; }
+    button.secondary:hover { background: #444; }
+    .error { color: #f87171; font-size: 14px; min-height: 20px; text-align: center; margin-top: 8px; }
+    
+    /* Chat UI */
+    #chat-screen { display: none; flex-direction: column; height: 80vh; }
+    .chat-header { display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid #333; padding-bottom: 10px; }
+    .chat-header button { width: auto; padding: 6px 12px; margin: 0; font-size: 14px; background: #dc2626; }
+    #messages { flex: 1; overflow-y: auto; padding: 12px 0; display: flex; flex-direction: column; gap: 8px; }
+    .msg { background: #2a2a2a; padding: 10px 14px; border-radius: 8px; max-width: 80%; word-wrap: break-word; }
+    .msg.mine { background: #4f46e5; align-self: flex-end; }
+    .msg.system { background: transparent; color: #888; font-size: 13px; align-self: center; text-align: center; }
+    .msg-user { font-size: 12px; font-weight: bold; opacity: 0.75; margin-bottom: 4px; }
+    .chat-input { display: flex; gap: 8px; padding-top: 10px; border-top: 1px solid #333; }
+    .chat-input input { margin: 0; }
+    .chat-input button { width: auto; margin: 0; padding: 0 20px; }
+  </style>
+</head>
+<body>
+
+  <!-- LOGIN / SIGNUP SCREEN -->
+  <div class="card" id="auth-screen">
+    <h2>Global Chat</h2>
+    <p style="font-size: 14px; color: #aaa; text-align: center;">
+      Your username is your password. Pick a unique one or enter yours to log back in.
+    </p>
+    <input type="text" id="username-input" placeholder="Enter username..." maxlength="20" />
+    <button id="signup-btn">Create New Username</button>
+    <button id="login-btn" class="secondary">Log In with Existing Username</button>
+    <div class="error" id="error-msg"></div>
+  </div>
+
+  <!-- CHAT SCREEN -->
+  <div class="card" id="chat-screen">
+    <div class="chat-header">
+      <span>Logged in as <strong id="display-user"></strong></span>
+      <button id="logout-btn">Log Out</button>
+    </div>
+    <div id="messages"></div>
+    <form class="chat-input" id="msg-form">
+      <input type="text" id="msg-input" placeholder="Type a message..." required autocomplete="off" />
+      <button type="submit">Send</button>
+    </form>
+  </div>
+
+  <script>
+    // Unique room ID so your chat doesn't collide with other PeerJS apps
+    const ROOM_HOST_ID = "6767";
+
+    let currentUser = null;
+    let peer = null;
+    let isHost = false;
+    let hostConn = null;
+    let clients = []; // Used if this browser becomes the room host
+
+    // Room memory (held by whoever is currently hosting the room)
+    let registeredUsers = new Set(); // lowercase usernames
+    let messageHistory = [];
+
+    const authScreen = document.getElementById("auth-screen");
+    const chatScreen = document.getElementById("chat-screen");
+    const usernameInput = document.getElementById("username-input");
+    const errorMsg = document.getElementById("error-msg");
+    const messagesDiv = document.getElementById("messages");
+    const signupBtn = document.getElementById("signup-btn");
+    const loginBtn = document.getElementById("login-btn");
+
+    function cleanName(raw) {
+      return raw.trim().replace(/[^a-zA-Z0-9_-]/g, "");
+    }
+
+    function setButtonsDisabled(state) {
+      signupBtn.disabled = state;
+      loginBtn.disabled = state;
+    }
+
+    signupBtn.addEventListener("click", () => startAuth("signup"));
+    loginBtn.addEventListener("click", () => startAuth("login"));
+
+    function startAuth(mode) {
+      const name = cleanName(usernameInput.value);
+      if (name.length < 3) {
+        errorMsg.textContent = "Username must be at least 3 letters/numbers.";
+        return;
+      }
+
+      setButtonsDisabled(true);
+      errorMsg.textContent = "Connecting to chat room...";
+
+      // Try claiming the Host ID first. If taken, someone else is already hosting!
+      const testHost = new Peer(ROOM_HOST_ID);
+
+      testHost.on("open", () => {
+        // Nobody was in the room yet, so THIS browser becomes the room host
+        isHost = true;
+        peer = testHost;
+        setupHostListeners();
+
+        if (mode === "login") {
+          // Room was empty so no accounts exist yet
+          peer.destroy();
+          isHost = false;
+          setButtonsDisabled(false);
+          errorMsg.textContent = "No active accounts found. Click 'Create New Username'!";
+          return;
+        }
+
+        registeredUsers.add(name.toLowerCase());
+        enterChat(name);
+        addSystemMessage("You started the room! Waiting for strangers to join...");
+      });
+
+      testHost.on("error", (err) => {
+        if (err.type === "unavailable-id") {
+          // A host already exists! Connect to them as a regular user
+          testHost.destroy();
+          connectAsClient(name, mode);
+        } else {
+          setButtonsDisabled(false);
+          errorMsg.textContent = "Connection error. Please try again.";
+        }
+      });
+    }
+
+    function connectAsClient(name, mode) {
+      peer = new Peer();
+      peer.on("open", () => {
+        hostConn = peer.connect(ROOM_HOST_ID);
+
+        hostConn.on("open", () => {
+          hostConn.send({ type: "auth", mode: mode, name: name });
+        });
+
+        hostConn.on("data", (data) => {
+          if (data.type === "auth-ok") {
+            enterChat(data.name);
+            data.history.forEach(m => renderMessage(m.user, m.text));
+          } else if (data.type === "auth-fail") {
+            errorMsg.textContent = data.reason;
+            setButtonsDisabled(false);
+            peer.destroy();
+          } else if (data.type === "chat") {
+            renderMessage(data.user, data.text);
+          } else if (data.type === "system") {
+            addSystemMessage(data.text);
+          }
+        });
+
+        hostConn.on("close", () => {
+          if (currentUser) {
+            addSystemMessage("The room host disconnected. Refresh to reconnect.");
+          }
+        });
+      });
+    }
+
+    function setupHostListeners() {
+      peer.on("connection", (conn) => {
+        conn.on("data", (data) => {
+          if (data.type === "auth") {
+            const lower = data.name.toLowerCase();
+            if (data.mode === "signup") {
+              if (registeredUsers.has(lower)) {
+                conn.send({ type: "auth-fail", reason: "Username already taken! Try another or click Log In." });
+                return;
+              }
+              registeredUsers.add(lower);
+              clients.push(conn);
+              conn.send({ type: "auth-ok", name: data.name, history: messageHistory });
+              broadcastSystem(`${data.name} joined the chat.`);
+            } else if (data.mode === "login") {
+              if (!registeredUsers.has(lower)) {
+                conn.send({ type: "auth-fail", reason: "Username not found. Click 'Create New Username'." });
+                return;
+              }
+              clients.push(conn);
+              conn.send({ type: "auth-ok", name: data.name, history: messageHistory });
+              broadcastSystem(`${data.name} logged back in.`);
+            }
+          } else if (data.type === "chat") {
+            const msg = { user: data.user, text: data.text };
+            messageHistory.push(msg);
+            renderMessage(msg.user, msg.text);
+            clients.forEach(c => { if (c.open) c.send({ type: "chat", ...msg }); });
+          }
+        });
+      });
+    }
+
+    function broadcastSystem(text) {
+      addSystemMessage(text);
+      clients.forEach(c => { if (c.open) c.send({ type: "system", text }); });
+    }
+
+    function enterChat(name) {
+      currentUser = name;
+      errorMsg.textContent = "";
+      messagesDiv.innerHTML = "";
+      document.getElementById("display-user").textContent = currentUser;
+      authScreen.style.display = "none";
+      chatScreen.style.display = "flex";
+    }
+
+    document.getElementById("msg-form").addEventListener("submit", (e) => {
+      e.preventDefault();
+      const input = document.getElementById("msg-input");
+      const text = input.value.trim();
+      if (!text || !currentUser) return;
+      input.value = "";
+
+      if (isHost) {
+        const msg = { user: currentUser, text };
+        messageHistory.push(msg);
+        renderMessage(msg.user, msg.text);
+        clients.forEach(c => { if (c.open) c.send({ type: "chat", ...msg }); });
+      } else if (hostConn && hostConn.open) {
+        hostConn.send({ type: "chat", user: currentUser, text });
+      }
+    });
+
+    function renderMessage(user, text) {
+      const div = document.createElement("div");
+      div.className = "msg" + (user === currentUser ? " mine" : "");
+
+      const userEl = document.createElement("div");
+      userEl.className = "msg-user";
+      userEl.textContent = user;
+
+      const textEl = document.createElement("div");
+      textEl.textContent = text;
+
+      div.appendChild(userEl);
+      div.appendChild(textEl);
+      messagesDiv.appendChild(div);
+      messagesDiv.scrollTop = messagesDiv.scrollHeight;
+    }
+
+    function addSystemMessage(text) {
+      const div = document.createElement("div");
+      div.className = "msg system";
+      div.textContent = text;
+      messagesDiv.appendChild(div);
+      messagesDiv.scrollTop = messagesDiv.scrollHeight;
+    }
+
+    document.getElementById("logout-btn").addEventListener("click", () => {
+      if (peer) peer.destroy();
+      currentUser = null;
+      isHost = false;
+      clients = [];
+      setButtonsDisabled(false);
+      usernameInput.value = "";
+      chatScreen.style.display = "none";
+      authScreen.style.display = "block";
+    });
+  </script>
+</body>
+</html>
